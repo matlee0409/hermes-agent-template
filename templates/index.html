@@ -745,6 +745,12 @@
       <span class="nav-badge" :class="{visible: pendingCount>0}" x-text="pendingCount"></span>
     </div>
 
+    <div class="nav-group-label" style="margin-top:8px">Manage</div>
+    <div class="nav-item" :class="{active: page==='backup'}" @click="page='backup'">
+      <span class="nav-icon">☁</span>
+      <span>Backup</span>
+    </div>
+
     <div class="nav-group-label" style="margin-top:8px">Resources</div>
     <div class="nav-item" :class="{active: page==='guide'}" @click="page='guide'">
       <span class="nav-icon">📖</span>
@@ -1266,6 +1272,104 @@
       </div>
     </div>
 
+    <!-- ── Backup panel ────────────────────────────── -->
+    <div class="panel" :class="{active: page==='backup'}">
+      <div class="panel-header">
+        <div class="panel-title">Backup</div>
+        <div class="panel-subtitle">Save your data to a GitHub repo</div>
+      </div>
+      <div class="panel-body">
+
+        <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--text-dim);">
+          Backs up config, workspace, memories and pairing state to a GitHub repo you own, so nothing is lost if the volume
+          is reset or the app is redeployed. API keys and tokens (<code>.env</code>, <code>auth.json</code>) are never
+          committed.
+        </div>
+
+        <div class="section-label">GitHub Repository</div>
+        <div class="card">
+          <div>
+            <label class="field-label">GitHub Token</label>
+            <input type="password" :value="vars.GITHUB_BACKUP_TOKEN||''" @input="vars.GITHUB_BACKUP_TOKEN=$event.target.value"
+                   placeholder="ghp_... (needs the 'repo' scope)">
+            <p class="hint">Create one at <a href="https://github.com/settings/tokens" target="_blank" style="color:var(--accent2);">github.com/settings/tokens</a> with the <code>repo</code> scope.</p>
+          </div>
+
+          <div class="field-gap">
+            <label class="field-label">Repository</label>
+            <div style="display:flex;gap:16px;margin-bottom:8px;">
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:400;color:var(--text-dim);cursor:pointer;">
+                <input type="radio" value="new" x-model="vars.GITHUB_BACKUP_MODE" style="width:auto;margin:0;">
+                Create new repo
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:400;color:var(--text-dim);cursor:pointer;">
+                <input type="radio" value="existing" x-model="vars.GITHUB_BACKUP_MODE" style="width:auto;margin:0;">
+                Use existing repo
+              </label>
+            </div>
+            <input type="text" :value="vars.GITHUB_BACKUP_REPO||''" @input="vars.GITHUB_BACKUP_REPO=$event.target.value"
+                   placeholder="your-username/hermes-backup">
+            <p class="hint">Format: <code>owner/repo-name</code>. New repos are created private. Existing repos must already be
+              accessible to the token.</p>
+          </div>
+
+          <div class="field-gap" style="display:flex;align-items:center;gap:8px;">
+            <input type="checkbox" style="width:auto;margin:0;" :checked="vars.GITHUB_BACKUP_AUTO==='true'"
+                   @change="vars.GITHUB_BACKUP_AUTO = $event.target.checked ? 'true' : 'false'">
+            <label style="font-size:13px;font-weight:400;color:var(--text-dim);margin:0;">Sync automatically every hour</label>
+          </div>
+
+          <p x-show="backup.error" x-text="backup.error" style="color:var(--red);margin:10px 0 0;font-size:12px;"></p>
+          <p x-show="backup.verified" style="color:var(--green);margin:10px 0 0;font-size:12px;">✓ Verified — ready to save</p>
+
+          <div style="display:flex;gap:10px;margin-top:16px;">
+            <button class="btn" @click="verifyBackup()" :disabled="backup.verifying || !vars.GITHUB_BACKUP_TOKEN || !vars.GITHUB_BACKUP_REPO">
+              <span x-show="!backup.verifying">Verify</span>
+              <span x-show="backup.verifying">Verifying…</span>
+            </button>
+            <button class="btn primary" @click="saveBackupConfig()" :disabled="backup.saving">
+              <span x-show="!backup.saving">Save</span>
+              <span x-show="backup.saving">Saving…</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="section-label" style="margin-top:20px;">Sync Status</div>
+        <div class="card">
+          <template x-if="!backupStatus.configured">
+            <div class="empty-state">Not configured yet — add a token and repo above, then Verify and Save.</div>
+          </template>
+          <template x-if="backupStatus.configured">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <div>
+                  <div style="font-size:13px;font-weight:500;">
+                    <a :href="'https://github.com/'+backupStatus.repo" target="_blank" style="color:var(--accent2);text-decoration:none;" x-text="backupStatus.repo"></a>
+                  </div>
+                  <div class="hint" style="margin-top:3px;">
+                    <span x-show="backupStatus.last_sync?.synced_at">Last synced <span x-text="fmtDate(backupStatus.last_sync.synced_at)"></span></span>
+                    <span x-show="!backupStatus.last_sync?.synced_at">Never synced yet</span>
+                    <span x-show="backupStatus.auto"> · auto hourly sync on</span>
+                  </div>
+                </div>
+                <button class="btn sm" @click="syncBackupNow()" :disabled="backup.syncing">
+                  <span x-show="!backup.syncing">Sync Now</span>
+                  <span x-show="backup.syncing">Syncing…</span>
+                </button>
+              </div>
+              <p x-show="backupStatus.last_sync?.commit_url" style="margin:0;font-size:12px;">
+                <a :href="backupStatus.last_sync.commit_url" target="_blank" style="color:var(--accent2);text-decoration:none;">
+                  Commit <span x-text="backupStatus.last_sync.commit"></span> →
+                </a>
+              </p>
+              <p x-show="backupStatus.last_sync?.error" x-text="backupStatus.last_sync.error" style="color:var(--red);margin:8px 0 0;font-size:12px;"></p>
+            </div>
+          </template>
+        </div>
+
+      </div>
+    </div>
+
     <!-- ── Guide panel ─────────────────────────────── -->
     <div class="panel" :class="{active: page==='guide'}">
       <div class="panel-header">
@@ -1457,6 +1561,9 @@ function app() {
 
     toolsEnabled: Object.fromEntries(tools.map(t => [t.key, false])),
 
+    backup: { verifying: false, verified: false, saving: false, syncing: false, error: '' },
+    backupStatus: { configured: false, repo: '', auto: false, last_sync: {} },
+
     get pendingCount() { return this.pending.length; },
 
     get configuredProviders() {
@@ -1579,10 +1686,69 @@ function app() {
     },
 
     async init() {
-      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing()]);
+      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadBackupStatus()]);
       setInterval(() => this.loadStatus(),  5000);
       setInterval(() => this.loadLogs(),    3000);
       setInterval(() => this.loadPairing(), 5000);
+      setInterval(() => this.loadBackupStatus(), 10000);
+    },
+
+    async loadBackupStatus() {
+      try {
+        const r = await fetch('/setup/api/backup/status');
+        if (r.ok) this.backupStatus = await r.json();
+      } catch {}
+    },
+
+    async verifyBackup() {
+      this.backup.verifying = true;
+      this.backup.error = '';
+      this.backup.verified = false;
+      try {
+        const r = await fetch('/setup/api/backup/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: this.vars.GITHUB_BACKUP_TOKEN && !this.vars.GITHUB_BACKUP_TOKEN.endsWith('***') ? this.vars.GITHUB_BACKUP_TOKEN : '',
+            repo: this.vars.GITHUB_BACKUP_REPO || '',
+            mode: this.vars.GITHUB_BACKUP_MODE || 'new',
+          }),
+        });
+        const d = await r.json();
+        if (r.ok) { this.backup.verified = true; this.notify('Verified', true); }
+        else { this.backup.error = d.error || 'Verification failed'; }
+      } catch (e) { this.backup.error = 'Network error: ' + e.message; }
+      this.backup.verifying = false;
+    },
+
+    async saveBackupConfig() {
+      this.backup.saving = true;
+      if (!this.vars.GITHUB_BACKUP_MODE) this.vars.GITHUB_BACKUP_MODE = 'new';
+      try {
+        const r = await fetch('/setup/api/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ vars: { ...this.vars }, _restart: false }),
+        });
+        if (r.ok) {
+          this.notify('Backup config saved', true);
+          await this.loadConfig();
+          await this.loadBackupStatus();
+        } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
+      } catch(e) { this.notify('Save failed: '+e.message, false); }
+      this.backup.saving = false;
+    },
+
+    async syncBackupNow() {
+      this.backup.syncing = true;
+      try {
+        const r = await fetch('/setup/api/backup/sync', { method: 'POST' });
+        const d = await r.json();
+        if (r.ok) this.notify(d.message || 'Backup synced', true);
+        else this.notify(d.error || 'Sync failed', false);
+        await this.loadBackupStatus();
+      } catch (e) { this.notify('Sync failed: ' + e.message, false); }
+      this.backup.syncing = false;
     },
 
     async loadConfig() {

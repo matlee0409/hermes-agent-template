@@ -151,6 +151,14 @@ ENV_VARS = [
     ("GATEWAY_ALLOW_ALL_USERS",  "Allow all users",          "gateway",   False),
     ("ADMIN_USERNAME",           "Admin username",           "admin",     False),
     ("ADMIN_PASSWORD",           "Admin password",           "admin",     True),
+    # GitHub data backup — periodically commits/pushes $HERMES_HOME (config,
+    # workspace, memories, pairing, etc. — but never secrets, see BACKUP_GITIGNORE)
+    # to a GitHub repo the user owns. Distinct from GITHUB_TOKEN above, which is
+    # a tool credential handed to the agent itself for code-related tasks.
+    ("GITHUB_BACKUP_TOKEN",      "GitHub token",             "backup",    True),
+    ("GITHUB_BACKUP_REPO",       "Repository (owner/name)",  "backup",    False),
+    ("GITHUB_BACKUP_MODE",       "Repo mode",                "backup",    False),
+    ("GITHUB_BACKUP_AUTO",       "Auto hourly sync",         "backup",    False),
 ]
 
 SECRET_KEYS  = {k for k, _, _, s in ENV_VARS if s}
@@ -909,6 +917,281 @@ gw = Gateway()
 cfg_lock = asyncio.Lock()
 
 
+# ── GitHub data backup ─────────────────────────────────────────────────────────
+# Mirrors the "alphaclaw" template's approach: git-init $HERMES_HOME itself and
+# push it to a GitHub repo the user owns (new or existing), so config, workspace
+# files, memories, and pairing state survive volume loss / migrations. Secrets
+# (.env, auth.json, PID files) are excluded via BACKUP_GITIGNORE — GitHub is not
+# a secrets store, and the backup token itself lives in .env, so committing it
+# would leak it into the repo.
+BACKUP_DIR = Path(HERMES_HOME)
+BACKUP_STATUS_FILE = BACKUP_DIR / ".backup_status.json"
+BACKUP_GITIGNORE_LINES = [
+    ".env",
+    "auth.json",
+    "gateway.pid",
+    ".install_method",
+    "*.sock",
+    "*.pid",
+]
+backup_lock = asyncio.Lock()
+backup_auto_task: asyncio.Task | None = None
+
+
+def _backup_github_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"token {token}",
+        "User-Agent": "hermes-agent-railway",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def _read_backup_status() -> dict:
+    return _pjson(BACKUP_STATUS_FILE)
+
+
+def _write_backup_status(data: dict) -> None:
+    _wjson(BACKUP_STATUS_FILE, data)
+
+
+async def _github_verify_repo(token: str, repo: str, mode: str = "new") -> dict:
+    """Verify a GitHub token/repo pair, mirroring alphaclaw's onboarding check.
+
+    mode="new": repo must not exist yet (or be empty) — will be created by
+    _github_ensure_repo if missing. mode="existing": repo must already exist
+    and be accessible.
+    """
+    repo = repo.strip().strip("/")
+    if not token:
+        return {"ok": False, "error": "Missing GitHub token"}
+    if "/" not in repo:
+        return {"ok": False, "error": 'Repository must be in "owner/name" format'}
+    owner, _, name = repo.partition("/")
+    headers = _backup_github_headers(token)
+    client = get_http_client()
+    try:
+        user_res = await client.get("https://api.github.com/user", headers=headers)
+    except Exception as e:
+        return {"ok": False, "error": f"GitHub request failed: {e}"}
+    if user_res.status_code != 200:
+        return {"ok": False, "error": f"Cannot verify GitHub token (HTTP {user_res.status_code})"}
+    viewer_login = str(user_res.json().get("login") or "")
+
+    try:
+        repo_res = await client.get(f"https://api.github.com/repos/{owner}/{name}", headers=headers)
+    except Exception as e:
+        return {"ok": False, "error": f"GitHub request failed: {e}"}
+
+    if repo_res.status_code == 404:
+        if mode == "existing":
+            return {"ok": False, "error": f'Repository "{repo}" not found. Check the name and token permissions.'}
+        if owner.lower() != viewer_login.lower():
+            return {
+                "ok": False,
+                "error": f'Repo owner "{owner}" does not match the authenticated user "{viewer_login}". '
+                         "Use your own username, or an org your token can create repos in.",
+            }
+        return {"ok": True, "repo_exists": False, "viewer_login": viewer_login}
+
+    if repo_res.status_code == 200:
+        commits_res = await client.get(
+            f"https://api.github.com/repos/{owner}/{name}/commits?per_page=1", headers=headers,
+        )
+        repo_is_empty = commits_res.status_code == 409
+        if mode == "new" and not repo_is_empty:
+            return {
+                "ok": False,
+                "error": f'Repository "{repo}" already exists and is not empty. '
+                         'Choose "Use existing repo" or pick a different name.',
+            }
+        return {"ok": True, "repo_exists": True, "repo_is_empty": repo_is_empty, "viewer_login": viewer_login}
+
+    return {"ok": False, "error": f"Cannot access repo (HTTP {repo_res.status_code}). Check token scopes."}
+
+
+async def _github_ensure_repo(token: str, repo: str) -> dict:
+    verification = await _github_verify_repo(token, repo, mode="new")
+    if not verification.get("ok"):
+        return verification
+    if verification.get("repo_exists"):
+        return {"ok": True}
+    owner, _, name = repo.strip().strip("/").partition("/")
+    headers = {**_backup_github_headers(token), "Content-Type": "application/json"}
+    client = get_http_client()
+    try:
+        create_res = await client.post(
+            "https://api.github.com/user/repos",
+            headers=headers,
+            json={"name": name, "private": True, "auto_init": False},
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"GitHub request failed: {e}"}
+    if create_res.status_code not in (200, 201):
+        detail = ""
+        try:
+            detail = create_res.json().get("message", "")
+        except Exception:
+            pass
+        return {"ok": False, "error": f"Failed to create repo: {detail or create_res.status_code}"}
+    return {"ok": True}
+
+
+async def _run_git(args: list[str], *, env: dict, timeout: float = 60) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=str(BACKUP_DIR),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise
+    return proc.returncode or 0, out.decode(errors="replace").strip()
+
+
+def _ensure_backup_gitignore() -> None:
+    gi_path = BACKUP_DIR / ".gitignore"
+    wanted = "\n".join(BACKUP_GITIGNORE_LINES) + "\n"
+    try:
+        existing = gi_path.read_text() if gi_path.exists() else ""
+    except Exception:
+        existing = ""
+    missing = [l for l in BACKUP_GITIGNORE_LINES if l not in existing.splitlines()]
+    if missing:
+        gi_path.write_text(existing + ("\n" if existing and not existing.endswith("\n") else "") + "\n".join(missing) + "\n")
+
+
+async def run_git_backup_sync(commit_message: str | None = None) -> dict:
+    """Commit + push $HERMES_HOME (minus secrets) to the configured backup repo."""
+    async with backup_lock:
+        data = read_env(ENV_FILE)
+        token = data.get("GITHUB_BACKUP_TOKEN", "")
+        repo = data.get("GITHUB_BACKUP_REPO", "").strip().strip("/")
+        if not token or not repo:
+            return {"ok": False, "error": "GitHub backup is not configured yet"}
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_backup_gitignore()
+
+        askpass_path = Path(f"/tmp/hermes-backup-askpass-{os.getpid()}.sh")
+        askpass_path.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  *Username*) printf "%s\\n" "x-access-token" ;;\n'
+            '  *) printf "%s\\n" "$HERMES_BACKUP_TOKEN" ;;\n'
+            "esac\n",
+        )
+        os.chmod(askpass_path, 0o700)
+
+        base_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        auth_env = {**base_env, "GIT_ASKPASS": str(askpass_path), "HERMES_BACKUP_TOKEN": token}
+        origin_url = f"https://github.com/{repo}.git"
+
+        try:
+            if not (BACKUP_DIR / ".git").exists():
+                rc, out = await _run_git(["init"], env=base_env)
+                if rc != 0:
+                    status = {"ok": False, "error": f"git init failed: {out[:400]}", "synced_at": time.time(), "repo": repo}
+                    _write_backup_status(status)
+                    return status
+
+            await _run_git(["config", "user.name", "Hermes Agent"], env=base_env)
+            await _run_git(["config", "user.email", "agent@hermes.local"], env=base_env)
+            await _run_git(["remote", "remove", "origin"], env=base_env)
+            await _run_git(["remote", "add", "origin", origin_url], env=base_env)
+
+            # Determine the branch to sync against. Prefer the remote's actual
+            # default branch (main, master, or whatever the existing repo uses)
+            # over whatever a fresh local `git init` happened to name HEAD —
+            # otherwise syncing against an existing repo silently creates a
+            # second, disconnected branch instead of updating the real one.
+            branch = ""
+            rc, out = await _run_git(["ls-remote", "--symref", "origin", "HEAD"], env=auth_env)
+            if rc == 0:
+                for line in out.splitlines():
+                    if line.startswith("ref:") and "refs/heads/" in line:
+                        branch = line.split("refs/heads/", 1)[1].split()[0].strip()
+                        break
+
+            local_branch = ""
+            rc, out = await _run_git(["symbolic-ref", "--short", "HEAD"], env=base_env)
+            if rc == 0 and out:
+                local_branch = out
+
+            if not branch:
+                branch = local_branch or "main"
+
+            if local_branch and local_branch != branch:
+                await _run_git(["branch", "-m", local_branch, branch], env=base_env)
+            elif not local_branch:
+                await _run_git(["checkout", "-b", branch], env=base_env)
+
+            rc, _ = await _run_git(["ls-remote", "--exit-code", "--heads", "origin", branch], env=auth_env)
+            if rc == 0:
+                rc, out = await _run_git(["pull", "--rebase", "--autostash", "origin", branch], env=auth_env)
+                if rc != 0:
+                    status = {"ok": False, "error": f"git pull failed: {out[:400]}", "synced_at": time.time(), "repo": repo}
+                    _write_backup_status(status)
+                    return status
+
+            await _run_git(["add", "-A"], env=base_env)
+            rc, _ = await _run_git(["diff", "--cached", "--quiet"], env=base_env)
+            if rc == 0:
+                status = {"ok": True, "message": "No changes to commit", "synced_at": time.time(), "repo": repo}
+                _write_backup_status(status)
+                return status
+
+            message = commit_message or "hermes-agent: backup sync"
+            rc, out = await _run_git(["commit", "-m", message], env=base_env)
+            if rc != 0:
+                status = {"ok": False, "error": f"git commit failed: {out[:400]}", "synced_at": time.time(), "repo": repo}
+                _write_backup_status(status)
+                return status
+
+            rc, out = await _run_git(["push", "-u", "origin", branch], env=auth_env)
+            if rc != 0:
+                status = {"ok": False, "error": f"git push failed: {out[:400]}", "synced_at": time.time(), "repo": repo}
+                _write_backup_status(status)
+                return status
+
+            rc, commit_hash = await _run_git(["rev-parse", "--short", "HEAD"], env=base_env)
+            status = {
+                "ok": True,
+                "synced_at": time.time(),
+                "commit": commit_hash if rc == 0 else "",
+                "repo": repo,
+                "commit_url": f"https://github.com/{repo}/commit/{commit_hash}" if rc == 0 else "",
+            }
+            _write_backup_status(status)
+            return status
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        finally:
+            try:
+                askpass_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+async def _backup_auto_loop():
+    """Hourly auto-sync loop, mirrors alphaclaw's cron-based hourly git sync."""
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            data = read_env(ENV_FILE)
+            if str(data.get("GITHUB_BACKUP_AUTO", "")).lower() in ("1", "true", "yes", "on"):
+                result = await run_git_backup_sync("hermes-agent: hourly auto sync")
+                if not result.get("ok"):
+                    print(f"[backup] auto-sync failed: {result.get('error')}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[backup] auto-sync loop error: {e!r}", flush=True)
+
+
 # ── Hermes dashboard subprocess ───────────────────────────────────────────────
 class Dashboard:
     """Manages the `hermes dashboard` subprocess (native Hermes web UI).
@@ -1090,6 +1373,47 @@ async def api_config_reset(request: Request):
             ENV_FILE.unlink()
         write_config_yaml({})
     return JSONResponse({"ok": True})
+
+
+# ── GitHub backup ─────────────────────────────────────────────────────────────
+async def api_backup_verify(request: Request):
+    if err := guard(request): return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    token = str(body.get("token", "")).strip()
+    repo = str(body.get("repo", "")).strip()
+    mode = str(body.get("mode", "new")).strip() or "new"
+    if not token:
+        existing = read_env(ENV_FILE)
+        token = existing.get("GITHUB_BACKUP_TOKEN", "")
+    if mode == "new":
+        result = await _github_ensure_repo(token, repo)
+    else:
+        result = await _github_verify_repo(token, repo, mode="existing")
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+async def api_backup_sync(request: Request):
+    if err := guard(request): return err
+    result = await run_git_backup_sync("hermes-agent: manual backup sync")
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+async def api_backup_status(request: Request):
+    if err := guard(request): return err
+    data = read_env(ENV_FILE)
+    configured = bool(data.get("GITHUB_BACKUP_TOKEN") and data.get("GITHUB_BACKUP_REPO"))
+    last = _read_backup_status()
+    return JSONResponse({
+        "configured": configured,
+        "repo": data.get("GITHUB_BACKUP_REPO", ""),
+        "auto": str(data.get("GITHUB_BACKUP_AUTO", "")).lower() in ("1", "true", "yes", "on"),
+        "last_sync": last,
+    })
 
 
 # ── Pairing ───────────────────────────────────────────────────────────────────
@@ -1346,9 +1670,13 @@ async def lifespan(app):
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
     await auto_start()
+    global backup_auto_task
+    backup_auto_task = asyncio.create_task(_backup_auto_loop())
     try:
         yield
     finally:
+        if backup_auto_task is not None:
+            backup_auto_task.cancel()
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
@@ -1530,6 +1858,9 @@ routes = [
     Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
     Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
+    Route("/setup/api/backup/verify",           api_backup_verify,   methods=["POST"]),
+    Route("/setup/api/backup/sync",             api_backup_sync,     methods=["POST"]),
+    Route("/setup/api/backup/status",           api_backup_status),
     Route("/setup/api/pairing/pending",         api_pairing_pending),
     Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
     Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
