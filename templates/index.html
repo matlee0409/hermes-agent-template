@@ -786,11 +786,68 @@
       </div>
       <div class="panel-body">
 
+        <!-- ── Welcome: Import existing data or start fresh ── -->
+        <template x-if="!isSetupDone && !setupChoice">
+          <div>
+            <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;font-size:13px;color:var(--text-dim);">
+              Welcome! Have data from a previous Hermes Agent instance? Restore it from your GitHub backup, or start fresh.
+            </div>
+
+            <div style="display:flex;gap:14px;flex-wrap:wrap;">
+              <div class="card" style="flex:1;min-width:260px;">
+                <p style="margin:0 0 6px;font-size:14px;font-weight:600;">Import from GitHub</p>
+                <p class="hint" style="margin:0 0 14px;line-height:1.55;">
+                  Restore memories, workspace files and folders from a backup repo (created by this app,
+                  or another instance running it). You'll set your API keys next.
+                </p>
+                <button class="btn primary" style="width:100%;" @click="setupChoice='import'">Import Existing Data</button>
+              </div>
+              <div class="card" style="flex:1;min-width:260px;">
+                <p style="margin:0 0 6px;font-size:14px;font-weight:600;">Start Fresh</p>
+                <p class="hint" style="margin:0 0 14px;line-height:1.55;">
+                  No previous data to restore. Set up your provider and API keys and get going right away.
+                </p>
+                <button class="btn" style="width:100%;" @click="setupChoice='new'">Start Fresh</button>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- ── Import step ── -->
+        <template x-if="!isSetupDone && setupChoice==='import'">
+          <div>
+            <div class="section-label">
+              Import from GitHub
+              <a href="#" @click.prevent="setupChoice=null" style="float:right;color:var(--text-dim);font-size:12px;font-weight:400;text-decoration:none;">← back</a>
+            </div>
+            <div class="card">
+              <div>
+                <label class="field-label">GitHub Token</label>
+                <input type="password" :value="onboardImportForm.token" @input="onboardImportForm.token=$event.target.value"
+                       placeholder="ghp_... (needs the 'repo' scope)">
+                <p class="hint">Create one at <a href="https://github.com/settings/tokens" target="_blank" style="color:var(--accent2);">github.com/settings/tokens</a> with the <code>repo</code> scope.</p>
+              </div>
+              <div class="field-gap">
+                <label class="field-label">Repository</label>
+                <input type="text" :value="onboardImportForm.repo" @input="onboardImportForm.repo=$event.target.value"
+                       placeholder="owner/hermes-backup">
+              </div>
+              <p x-show="onboardImportForm.importError" x-text="onboardImportForm.importError" style="color:var(--red);margin:10px 0 0;font-size:12px;"></p>
+              <button class="btn primary" style="width:100%;margin-top:16px;" @click="importBackup(onboardImportForm)"
+                      :disabled="onboardImportForm.importing || !onboardImportForm.repo || !onboardImportForm.token">
+                <span x-show="!onboardImportForm.importing">Import &amp; Continue</span>
+                <span x-show="onboardImportForm.importing">Importing…</span>
+              </button>
+            </div>
+          </div>
+        </template>
+
+        <!-- LLM Provider -->
+        <div x-show="isSetupDone || setupChoice==='new'">
         <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--text-dim);">
           New to Hermes? Head over to the <a href="#" @click.prevent="page='guide'" style="color:var(--accent2);text-decoration:none;font-weight:500;">How to Setup</a> section for a step-by-step guide on getting started.
         </div>
 
-        <!-- LLM Provider -->
         <div class="section-label">
           LLM Provider
           <span class="req-note">* required</span>
@@ -1133,6 +1190,7 @@
           </button>
         </div>
       </div>
+      </div>
     </div>
 
     <!-- ── Status panel ────────────────────────────── -->
@@ -1352,12 +1410,12 @@
             <input type="text" :value="importForm.repo" @input="importForm.repo=$event.target.value"
                    placeholder="owner/hermes-backup">
           </div>
-          <p x-show="backup.importError" x-text="backup.importError" style="color:var(--red);margin:10px 0 0;font-size:12px;"></p>
-          <p x-show="backup.imported" style="color:var(--green);margin:10px 0 0;font-size:12px;">✓ Import complete — data restored</p>
-          <button class="btn danger" style="width:100%;margin-top:14px;" @click="importBackup()"
-                  :disabled="backup.importing || !importForm.repo">
-            <span x-show="!backup.importing">Import &amp; Overwrite Local Data</span>
-            <span x-show="backup.importing">Importing…</span>
+          <p x-show="importForm.importError" x-text="importForm.importError" style="color:var(--red);margin:10px 0 0;font-size:12px;"></p>
+          <p x-show="importForm.imported" style="color:var(--green);margin:10px 0 0;font-size:12px;">✓ Import complete — data restored</p>
+          <button class="btn danger" style="width:100%;margin-top:14px;" @click="importBackup(importForm)"
+                  :disabled="importForm.importing || !importForm.repo">
+            <span x-show="!importForm.importing">Import &amp; Overwrite Local Data</span>
+            <span x-show="importForm.importing">Importing…</span>
           </button>
         </div>
 
@@ -1588,9 +1646,11 @@ function app() {
 
     toolsEnabled: Object.fromEntries(tools.map(t => [t.key, false])),
 
-    backup: { verifying: false, verified: false, saving: false, syncing: false, error: '', importing: false, imported: false, importError: '' },
+    backup: { verifying: false, verified: false, saving: false, syncing: false, error: '' },
     backupStatus: { configured: false, repo: '', auto: false, last_sync: {} },
-    importForm: { token: '', repo: '' },
+    importForm: { token: '', repo: '', importing: false, imported: false, importError: '' },
+    onboardImportForm: { token: '', repo: '', importing: false, imported: false, importError: '' },
+    setupChoice: null,
 
     get pendingCount() { return this.pending.length; },
 
@@ -1767,27 +1827,40 @@ function app() {
       this.backup.saving = false;
     },
 
-    async importBackup() {
-      if (!confirm('This will overwrite local memories, workspace files and folders with the contents of that repo. Continue?')) return;
-      this.backup.importing = true;
-      this.backup.importError = '';
-      this.backup.imported = false;
+    async importBackup(form) {
+      // `form` is either `this.importForm` (Backup panel, destructive on an
+      // already-running instance) or `this.onboardImportForm` (first-run
+      // wizard, expected/harmless since there's nothing local yet) — each
+      // keeps its own token/repo/error/imported/importing state so the two
+      // flows never bleed into each other.
+      const onboarding = form === this.onboardImportForm;
+      if (!onboarding && !confirm('This will overwrite local memories, workspace files and folders with the contents of that repo. Continue?')) return;
+      form.importing = true;
+      form.importError = '';
+      form.imported = false;
       try {
         const r = await fetch('/setup/api/backup/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: this.importForm.token, repo: this.importForm.repo }),
+          body: JSON.stringify({ token: form.token, repo: form.repo }),
         });
         const d = await r.json();
         if (r.ok) {
-          this.backup.imported = true;
+          form.imported = true;
           this.notify('Data imported', true);
           await Promise.all([this.loadConfig(), this.loadBackupStatus()]);
+          if (onboarding) {
+            // Data (memories/workspace) is restored, but API keys are never
+            // part of the backup — hand off to the normal provider setup
+            // form so the user re-enters keys and starts the gateway.
+            this.setupChoice = 'new';
+            this.notify('Data restored — now add your API keys to continue', true);
+          }
         } else {
-          this.backup.importError = d.error || 'Import failed';
+          form.importError = d.error || 'Import failed';
         }
-      } catch (e) { this.backup.importError = 'Network error: ' + e.message; }
-      this.backup.importing = false;
+      } catch (e) { form.importError = 'Network error: ' + e.message; }
+      form.importing = false;
     },
 
     async syncBackupNow() {
@@ -1860,6 +1933,8 @@ function app() {
         await this.loadConfig();
         this.selectedProvider = '';
         this.page = 'setup';
+        this.setupChoice = null;
+        this.onboardImportForm = { token: '', repo: '', importing: false, imported: false, importError: '' };
         this.notify('Config reset', true);
       } else {
         this.notify('Reset failed', false);
