@@ -750,6 +750,11 @@
       <span class="nav-icon">☁</span>
       <span>Backup</span>
     </div>
+    <div class="nav-item" :class="{active: page==='update'}" @click="page='update'">
+      <span class="nav-icon">⬆</span>
+      <span>Update</span>
+      <span class="nav-badge" :class="{visible: updateInfo.update_available}" x-text="'●'" style="font-size:8px;"></span>
+    </div>
 
     <div class="nav-group-label" style="margin-top:8px">Resources</div>
     <div class="nav-item" :class="{active: page==='guide'}" @click="page='guide'">
@@ -1455,6 +1460,77 @@
       </div>
     </div>
 
+    <!-- ── Update panel ────────────────────────────── -->
+    <div class="panel" :class="{active: page==='update'}">
+      <div class="panel-header">
+        <div class="panel-title">Update</div>
+        <div class="panel-subtitle">Keep Hermes Agent up to date</div>
+      </div>
+      <div class="panel-body">
+
+        <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--text-dim);line-height:1.55;">
+          This app runs Hermes Agent from a pinned, immutable build (<code>HERMES_REF</code>), not a
+          live checkout — so Hermes's own <code>hermes update</code> can't pull new code into it and
+          have that survive a redeploy. Bump the pinned version and redeploy to actually upgrade.
+        </div>
+
+        <div class="section-label">Version</div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div class="field-label" style="margin-bottom:4px;">Currently pinned</div>
+              <div style="font-size:15px;font-weight:500;" x-text="updateInfo.current || '(unknown)'"></div>
+            </div>
+            <button class="btn" @click="checkForUpdate()" :disabled="update.checking">
+              <span x-show="!update.checking">Check for Updates</span>
+              <span x-show="update.checking">Checking…</span>
+            </button>
+          </div>
+
+          <template x-if="updateInfo.error">
+            <p x-text="updateInfo.error" style="color:var(--red);margin:12px 0 0;font-size:12px;"></p>
+          </template>
+
+          <template x-if="updateInfo.latest && !updateInfo.update_available && !updateInfo.error">
+            <p style="color:var(--green);margin:12px 0 0;font-size:13px;">✓ You're on the latest release.</p>
+          </template>
+
+          <template x-if="updateInfo.update_available">
+            <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
+              <div style="font-size:13px;margin-bottom:10px;">
+                A newer release is available: <strong x-text="updateInfo.latest"></strong>
+                (<a :href="'https://github.com/NousResearch/hermes-agent/releases/tag/'+updateInfo.latest" target="_blank" style="color:var(--accent2);">release notes</a>)
+              </div>
+              <p class="hint" style="line-height:1.55;margin:0 0 10px;">
+                To upgrade: set <code>HERMES_REF=<span x-text="updateInfo.latest"></span></code> as a build
+                arg / env var for this project (or bump the <code>ARG HERMES_REF</code> default in the
+                <code>Dockerfile</code>), then redeploy. When jumping releases, re-check the Dockerfile's
+                install extras against upstream's <code>pyproject.toml</code>.
+              </p>
+              <button class="btn sm" @click="copyText('HERMES_REF='+updateInfo.latest)">Copy HERMES_REF value</button>
+            </div>
+          </template>
+        </div>
+
+        <div class="section-label" style="margin-top:20px;">Run <code>hermes update</code></div>
+        <div class="card">
+          <p class="hint" style="margin:0 0 12px;line-height:1.55;">
+            Runs Hermes's own updater directly against this install. On a container build like this one,
+            Hermes is expected to correctly detect that and refuse — the exact message is shown below so
+            you can see it did the right thing instead of silently doing nothing.
+          </p>
+          <button class="btn" @click="runHermesUpdate()" :disabled="update.running">
+            <span x-show="!update.running">Run hermes update</span>
+            <span x-show="update.running">Running…</span>
+          </button>
+          <template x-if="update.output">
+            <pre style="margin-top:12px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;" x-text="update.output"></pre>
+          </template>
+        </div>
+
+      </div>
+    </div>
+
     <!-- ── Guide panel ─────────────────────────────── -->
     <div class="panel" :class="{active: page==='guide'}">
       <div class="panel-header">
@@ -1652,6 +1728,9 @@ function app() {
     onboardImportForm: { token: '', repo: '', importing: false, imported: false, importError: '' },
     setupChoice: null,
 
+    update: { checking: false, running: false, output: '' },
+    updateInfo: { current: '', latest: null, update_available: false, error: null },
+
     get pendingCount() { return this.pending.length; },
 
     get configuredProviders() {
@@ -1774,7 +1853,7 @@ function app() {
     },
 
     async init() {
-      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadBackupStatus()]);
+      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadBackupStatus(), this.checkForUpdate()]);
       setInterval(() => this.loadStatus(),  5000);
       setInterval(() => this.loadLogs(),    3000);
       setInterval(() => this.loadPairing(), 5000);
@@ -1873,6 +1952,37 @@ function app() {
         await this.loadBackupStatus();
       } catch (e) { this.notify('Sync failed: ' + e.message, false); }
       this.backup.syncing = false;
+    },
+
+    async checkForUpdate() {
+      this.update.checking = true;
+      try {
+        const r = await fetch('/setup/api/update/check');
+        const d = await r.json();
+        this.updateInfo = d;
+      } catch (e) { this.updateInfo.error = e.message; }
+      this.update.checking = false;
+    },
+
+    async runHermesUpdate() {
+      this.update.running = true;
+      this.update.output = '';
+      try {
+        const r = await fetch('/setup/api/update/run', { method: 'POST' });
+        const d = await r.json();
+        this.update.output = d.message || d.output || (r.ok ? 'Done.' : 'Update failed.');
+        if (d.ok) this.notify('Update finished', true);
+        else if (d.refused) this.notify('Update refused — see details below', false);
+        else this.notify('Update failed', false);
+      } catch (e) { this.update.output = e.message; this.notify('Update failed: ' + e.message, false); }
+      this.update.running = false;
+    },
+
+    copyText(text) {
+      navigator.clipboard?.writeText(text).then(
+        () => this.notify('Copied to clipboard', true),
+        () => this.notify('Could not copy', false),
+      );
     },
 
     async loadConfig() {

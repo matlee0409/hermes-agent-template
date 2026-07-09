@@ -62,6 +62,14 @@ ENV_FILE = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 PAIRING_TTL = 3600
 
+# The upstream git ref this image was built against (baked in as a build ARG
+# *and* persisted as a runtime ENV in the Dockerfile — see `HERMES_REF`).
+# Used purely for display/"is a newer release available" comparisons in the
+# dashboard's Update panel; it is not the live installed version (there's no
+# reliable `hermes --version` across releases), just what we know we shipped.
+HERMES_REF = os.environ.get("HERMES_REF", "")
+HERMES_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
+
 # Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
@@ -1542,6 +1550,86 @@ async def api_config_reset(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ── Hermes self-update ───────────────────────────────────────────────────────
+# Hermes Agent ships a real `hermes update` (git pull + `uv pip install -e`)
+# for pip/git checkouts. This template installs it as an editable git clone
+# baked into an immutable container image, then intentionally strips
+# `/opt/hermes-agent/.git` and stamps `$HERMES_HOME/.install_method=docker`
+# (see start.sh) so hermes's own installer detects "container install" and
+# refuses to self-update — a runtime `git pull` has no `.git` to pull into,
+# and even if it could, the change wouldn't survive the next redeploy and
+# would desync the Python package from the image's pre-built web/TUI bundles.
+#
+# So "the update feature" here is not a literal `hermes update` button; it's
+# the real upgrade path for this deployment shape: tell the user what's
+# currently pinned (HERMES_REF), tell them what's newer upstream, and let one
+# click write the new HERMES_REF into this repl's env so the *next* deploy
+# picks it up (Dockerfile's `ARG HERMES_REF` reads it in). We still surface
+# `hermes update`'s own output if invoked, so the refusal is explained inline
+# instead of silently failing.
+async def api_update_check(request: Request):
+    if err := guard(request): return err
+    result: dict = {"current": HERMES_REF, "latest": None, "update_available": False, "error": None}
+    try:
+        client = get_http_client()
+        res = await client.get(HERMES_RELEASES_API, headers={"Accept": "application/vnd.github+json"})
+        if res.status_code == 200:
+            latest = str(res.json().get("tag_name", "")).strip()
+            result["latest"] = latest
+            if latest and latest != HERMES_REF:
+                result["update_available"] = True
+        else:
+            result["error"] = f"GitHub API returned {res.status_code}"
+    except Exception as e:
+        result["error"] = str(e)
+    return JSONResponse(result)
+
+
+async def api_update_run(request: Request):
+    if err := guard(request): return err
+    # Mirrors hermes's own install-method check so the dashboard shows the
+    # exact same refusal a user would get running `hermes update` by hand,
+    # rather than us silently no-op'ing or pretending to succeed.
+    install_method_file = Path(HERMES_HOME) / ".install_method"
+    install_method = install_method_file.read_text().strip() if install_method_file.exists() else ""
+    if install_method == "docker":
+        return JSONResponse({
+            "ok": False,
+            "refused": True,
+            "install_method": install_method,
+            "message": (
+                "This is a container install — hermes refuses to self-update at runtime "
+                "because the change wouldn't survive the next redeploy and could desync "
+                "from the image's pre-built assets. Bump HERMES_REF and redeploy instead."
+            ),
+        })
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "hermes", "update",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "HERMES_HOME": HERMES_HOME},
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+        output = out.decode(errors="replace") if out else ""
+        return JSONResponse({"ok": proc.returncode == 0, "refused": False, "output": output})
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "refused": False, "output": "`hermes` binary not found on PATH."}, status_code=500)
+    except asyncio.TimeoutError:
+        # `wait_for` timing out only cancels our await — it does NOT stop the
+        # child. Without an explicit kill+reap here, `hermes update` (a git
+        # pull + `uv pip install -e`) keeps running in the background after we
+        # report a timeout, leaking a process and racing any later Start/Stop.
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return JSONResponse({"ok": False, "refused": False, "output": "Timed out waiting for `hermes update`."}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"ok": False, "refused": False, "output": str(e)}, status_code=500)
+
+
 # ── GitHub backup ─────────────────────────────────────────────────────────────
 async def api_backup_verify(request: Request):
     if err := guard(request): return err
@@ -2040,6 +2128,8 @@ routes = [
     Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
     Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
+    Route("/setup/api/update/check",            api_update_check),
+    Route("/setup/api/update/run",              api_update_run,      methods=["POST"]),
     Route("/setup/api/backup/verify",           api_backup_verify,   methods=["POST"]),
     Route("/setup/api/backup/sync",             api_backup_sync,     methods=["POST"]),
     Route("/setup/api/backup/import",           api_backup_import,   methods=["POST"]),

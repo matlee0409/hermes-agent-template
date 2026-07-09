@@ -9,6 +9,10 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
 ARG HERMES_REF=v2026.7.7.2
+# Persist the build-time ref as a runtime env var too, so the running
+# container (and the dashboard's Update panel) knows what it was built
+# against — ARG alone is build-only and invisible to the process at runtime.
+ENV HERMES_REF=${HERMES_REF}
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
