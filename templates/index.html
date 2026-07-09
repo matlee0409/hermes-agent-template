@@ -1334,6 +1334,33 @@
           </div>
         </div>
 
+        <div class="section-label" style="margin-top:20px;">Restore From a Repo</div>
+        <div class="card">
+          <p class="hint" style="margin:0 0 12px;line-height:1.55;">
+            Point this at a repo previously created by Backup (this app's own, or one from another
+            instance) to pull down its memories, workspace files and folders. This
+            <strong>overwrites</strong> the local data with the repo's contents — your API keys and
+            tokens are never touched since they're excluded from the backup itself.
+          </p>
+          <div>
+            <label class="field-label">GitHub Token</label>
+            <input type="password" :value="importForm.token" @input="importForm.token=$event.target.value"
+                   placeholder="Leave blank to use the token saved above">
+          </div>
+          <div class="field-gap">
+            <label class="field-label">Repository to import</label>
+            <input type="text" :value="importForm.repo" @input="importForm.repo=$event.target.value"
+                   placeholder="owner/hermes-backup">
+          </div>
+          <p x-show="backup.importError" x-text="backup.importError" style="color:var(--red);margin:10px 0 0;font-size:12px;"></p>
+          <p x-show="backup.imported" style="color:var(--green);margin:10px 0 0;font-size:12px;">✓ Import complete — data restored</p>
+          <button class="btn danger" style="width:100%;margin-top:14px;" @click="importBackup()"
+                  :disabled="backup.importing || !importForm.repo">
+            <span x-show="!backup.importing">Import &amp; Overwrite Local Data</span>
+            <span x-show="backup.importing">Importing…</span>
+          </button>
+        </div>
+
         <div class="section-label" style="margin-top:20px;">Sync Status</div>
         <div class="card">
           <template x-if="!backupStatus.configured">
@@ -1561,8 +1588,9 @@ function app() {
 
     toolsEnabled: Object.fromEntries(tools.map(t => [t.key, false])),
 
-    backup: { verifying: false, verified: false, saving: false, syncing: false, error: '' },
+    backup: { verifying: false, verified: false, saving: false, syncing: false, error: '', importing: false, imported: false, importError: '' },
     backupStatus: { configured: false, repo: '', auto: false, last_sync: {} },
+    importForm: { token: '', repo: '' },
 
     get pendingCount() { return this.pending.length; },
 
@@ -1737,6 +1765,29 @@ function app() {
         } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
       } catch(e) { this.notify('Save failed: '+e.message, false); }
       this.backup.saving = false;
+    },
+
+    async importBackup() {
+      if (!confirm('This will overwrite local memories, workspace files and folders with the contents of that repo. Continue?')) return;
+      this.backup.importing = true;
+      this.backup.importError = '';
+      this.backup.imported = false;
+      try {
+        const r = await fetch('/setup/api/backup/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: this.importForm.token, repo: this.importForm.repo }),
+        });
+        const d = await r.json();
+        if (r.ok) {
+          this.backup.imported = true;
+          this.notify('Data imported', true);
+          await Promise.all([this.loadConfig(), this.loadBackupStatus()]);
+        } else {
+          this.backup.importError = d.error || 'Import failed';
+        }
+      } catch (e) { this.backup.importError = 'Network error: ' + e.message; }
+      this.backup.importing = false;
     },
 
     async syncBackupNow() {

@@ -37,7 +37,7 @@ import signal
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 import websockets
@@ -934,6 +934,12 @@ BACKUP_GITIGNORE_LINES = [
     "*.sock",
     "*.pid",
 ]
+# Literal protected paths — snapshotted/restored around destructive git ops
+# during import, and checked against the remote tree before importing at all.
+BACKUP_PROTECTED_PATHS = [".env", "auth.json", "gateway.pid", ".install_method"]
+# Glob-only protected patterns (PIDs/sockets change name at runtime) — matched
+# at the top level of BACKUP_DIR for the same snapshot/restore treatment.
+BACKUP_PROTECTED_GLOBS = ["*.sock", "*.pid"]
 backup_lock = asyncio.Lock()
 backup_auto_task: asyncio.Task | None = None
 
@@ -1176,6 +1182,167 @@ async def run_git_backup_sync(commit_message: str | None = None) -> dict:
                 pass
 
 
+async def run_git_backup_import(token: str = "", repo: str = "") -> dict:
+    """Restore $HERMES_HOME (memories, workspace files, config) from a backup repo.
+
+    Fetches the given repo and hard-resets the local data dir to match its
+    default branch. Secrets are protected because `git reset --hard` /
+    `git clean -fd` only ever touch tracked or non-ignored files, and `.env`,
+    `auth.json`, pid/sock files stay listed in .gitignore the whole time.
+    """
+    async with backup_lock:
+        data = read_env(ENV_FILE)
+        token = token.strip() or data.get("GITHUB_BACKUP_TOKEN", "")
+        repo = (repo or data.get("GITHUB_BACKUP_REPO", "")).strip().strip("/")
+        if not token or not repo:
+            return {"ok": False, "error": "GitHub token and repo are required"}
+
+        verification = await _github_verify_repo(token, repo, mode="existing")
+        if not verification.get("ok"):
+            return verification
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        askpass_path = Path(f"/tmp/hermes-backup-askpass-{os.getpid()}.sh")
+        askpass_path.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  *Username*) printf "%s\\n" "x-access-token" ;;\n'
+            '  *) printf "%s\\n" "$HERMES_BACKUP_TOKEN" ;;\n'
+            "esac\n",
+        )
+        os.chmod(askpass_path, 0o700)
+
+        base_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        auth_env = {**base_env, "GIT_ASKPASS": str(askpass_path), "HERMES_BACKUP_TOKEN": token}
+        origin_url = f"https://github.com/{repo}.git"
+
+        try:
+            if not (BACKUP_DIR / ".git").exists():
+                rc, out = await _run_git(["init"], env=base_env)
+                if rc != 0:
+                    return {"ok": False, "error": f"git init failed: {out[:400]}"}
+
+            await _run_git(["config", "user.name", "Hermes Agent"], env=base_env)
+            await _run_git(["config", "user.email", "agent@hermes.local"], env=base_env)
+            await _run_git(["remote", "remove", "origin"], env=base_env)
+            await _run_git(["remote", "add", "origin", origin_url], env=base_env)
+
+            rc, out = await _run_git(["fetch", "origin"], env=auth_env)
+            if rc != 0:
+                return {"ok": False, "error": f"git fetch failed: {out[:400]}"}
+
+            branch = ""
+            rc, out = await _run_git(["ls-remote", "--symref", "origin", "HEAD"], env=auth_env)
+            if rc == 0:
+                for line in out.splitlines():
+                    if line.startswith("ref:") and "refs/heads/" in line:
+                        branch = line.split("refs/heads/", 1)[1].split()[0].strip()
+                        break
+            if not branch:
+                return {"ok": False, "error": "Could not determine the repo's default branch (is it empty?)"}
+
+            # Refuse to import if the remote tracks any of our protected/secret
+            # paths — reset --hard would happily overwrite them with remote
+            # content, and we never want secret material coming *from* a repo.
+            rc, out = await _run_git(["ls-tree", "-r", "--name-only", f"origin/{branch}"], env=base_env)
+            if rc != 0:
+                return {"ok": False, "error": f"git ls-tree failed: {out[:400]}"}
+            import fnmatch
+            remote_files = out.splitlines()
+            protected_names = set(BACKUP_PROTECTED_PATHS)
+            forbidden_hit = []
+            for f in remote_files:
+                base = PurePosixPath(f).name
+                if base in protected_names or any(fnmatch.fnmatch(base, pat) for pat in BACKUP_PROTECTED_GLOBS):
+                    forbidden_hit.append(f)
+            if forbidden_hit:
+                return {
+                    "ok": False,
+                    "error": f"Refusing to import: the remote repo tracks protected file(s) {forbidden_hit} — "
+                             "this backup source is not trustworthy.",
+                }
+
+            # Snapshot protected local files/dirs before any destructive git
+            # operation. `reset --hard` can overwrite tracked paths and
+            # `clean -fd` can delete untracked ones regardless of what the
+            # *remote's* .gitignore says, so we restore our own copies
+            # afterwards rather than relying on ignore rules alone.
+            import shutil
+            import tempfile
+            snapshot_dir = Path(tempfile.mkdtemp(prefix="hermes-backup-protect-"))
+            snapshots: list[tuple[Path, Path]] = []
+            protected_names = set(BACKUP_PROTECTED_PATHS)
+            protected_rel_paths: list[str] = []
+            for p in BACKUP_DIR.rglob("*"):
+                if not p.is_file() or ".git" in p.relative_to(BACKUP_DIR).parts:
+                    continue
+                if p.name in protected_names or any(fnmatch.fnmatch(p.name, pat) for pat in BACKUP_PROTECTED_GLOBS):
+                    protected_rel_paths.append(str(p.relative_to(BACKUP_DIR)))
+            for rel in protected_rel_paths:
+                src = BACKUP_DIR / rel
+                if src.exists():
+                    dst = snapshot_dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if src.is_dir():
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                    snapshots.append((src, dst))
+
+            try:
+                rc, out = await _run_git(["reset", "--hard", f"origin/{branch}"], env=base_env)
+                if rc != 0:
+                    return {"ok": False, "error": f"git reset failed: {out[:400]}"}
+
+                # Remove files not present in the imported snapshot.
+                await _run_git(["clean", "-fd"], env=base_env)
+                await _run_git(["branch", "-M", branch], env=base_env)
+            finally:
+                # Restore protected files regardless of outcome above — they
+                # must never be left missing, truncated, or replaced by
+                # whatever the remote repo happened to contain.
+                for src, dst in snapshots:
+                    if src.exists():
+                        if src.is_dir():
+                            shutil.rmtree(src)
+                        else:
+                            src.unlink()
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.is_dir():
+                        shutil.copytree(dst, src)
+                    else:
+                        shutil.copy2(dst, src)
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+            # Re-assert our secret exclusions in case the imported repo's
+            # .gitignore is missing or stale, before anything else writes here.
+            _ensure_backup_gitignore()
+
+            async with cfg_lock:
+                current = read_env(ENV_FILE)
+                current["GITHUB_BACKUP_TOKEN"] = token
+                current["GITHUB_BACKUP_REPO"] = repo
+                current["GITHUB_BACKUP_MODE"] = "existing"
+                write_env(ENV_FILE, current)
+
+            rc, commit_hash = await _run_git(["rev-parse", "--short", "HEAD"], env=base_env)
+            status = {
+                "ok": True,
+                "imported_at": time.time(),
+                "commit": commit_hash if rc == 0 else "",
+                "repo": repo,
+            }
+            return status
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        finally:
+            try:
+                askpass_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 async def _backup_auto_loop():
     """Hourly auto-sync loop, mirrors alphaclaw's cron-based hourly git sync."""
     while True:
@@ -1399,6 +1566,21 @@ async def api_backup_verify(request: Request):
 async def api_backup_sync(request: Request):
     if err := guard(request): return err
     result = await run_git_backup_sync("hermes-agent: manual backup sync")
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+async def api_backup_import(request: Request):
+    if err := guard(request): return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = str(body.get("token", "")).strip()
+    if token.endswith("***"):
+        token = ""
+    repo = str(body.get("repo", "")).strip()
+    result = await run_git_backup_import(token=token, repo=repo)
     status_code = 200 if result.get("ok") else 400
     return JSONResponse(result, status_code=status_code)
 
@@ -1860,6 +2042,7 @@ routes = [
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
     Route("/setup/api/backup/verify",           api_backup_verify,   methods=["POST"]),
     Route("/setup/api/backup/sync",             api_backup_sync,     methods=["POST"]),
+    Route("/setup/api/backup/import",           api_backup_import,   methods=["POST"]),
     Route("/setup/api/backup/status",           api_backup_status),
     Route("/setup/api/pairing/pending",         api_pairing_pending),
     Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),

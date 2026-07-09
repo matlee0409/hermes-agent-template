@@ -1,0 +1,1 @@
+- [Git-based data import/restore secret safety](git-import-secret-safety.md) — destructive git reset/clean during a repo import can silently overwrite or delete local secret files; ignore rules alone are not enough.
