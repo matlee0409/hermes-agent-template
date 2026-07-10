@@ -279,7 +279,7 @@ def write_env(path: Path, data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cat_order = ["model", "provider", "bedrock", "azure", "custom", "tool",
                  "telegram", "discord", "slack", "whatsapp",
-                 "email", "mattermost", "matrix", "gateway", "admin"]
+                 "email", "mattermost", "matrix", "gateway", "admin", "backup"]
     cat_labels = {
         "model": "Model", "provider": "Providers",
         "bedrock": "AWS Bedrock", "azure": "Azure Foundry",
@@ -287,7 +287,7 @@ def write_env(path: Path, data: dict[str, str]) -> None:
         "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
         "whatsapp": "WhatsApp", "email": "Email",
         "mattermost": "Mattermost", "matrix": "Matrix", "gateway": "Gateway",
-        "admin": "Admin",
+        "admin": "Admin", "backup": "GitHub Backup",
     }
     key_cat = {k: c for k, _, c, _ in ENV_VARS}
     grouped: dict[str, list[str]] = {c: [] for c in cat_order}
@@ -299,11 +299,22 @@ def write_env(path: Path, data: dict[str, str]) -> None:
         cat = key_cat.get(k, "other")
         grouped.setdefault(cat, []).append(f"{k}={v}")
 
+    # Any category present in ENV_VARS but missing from cat_order above would
+    # otherwise be silently dropped here: setdefault() puts its entries in
+    # `grouped`, but a category that's neither in cat_order nor "other" was
+    # never iterated when building `lines` — the values simply vanished from
+    # .env on every save with no error. (This is exactly what happened to
+    # GitHub Backup settings before "backup" was added to cat_order.) Render
+    # every remaining category defensively instead of trusting the list stays
+    # in sync with ENV_VARS.
+    remaining = [c for c in grouped if c not in cat_order and c != "other"]
+    render_order = cat_order + sorted(remaining)
+
     lines: list[str] = []
-    for cat in cat_order:
+    for cat in render_order:
         entries = sorted(grouped.get(cat, []))
         if entries:
-            lines.append(f"# {cat_labels.get(cat, cat)}")
+            lines.append(f"# {cat_labels.get(cat, cat.title())}")
             lines.extend(entries)
             lines.append("")
     if grouped["other"]:
@@ -1084,8 +1095,22 @@ async def run_git_backup_sync(commit_message: str | None = None) -> dict:
         data = read_env(ENV_FILE)
         token = data.get("GITHUB_BACKUP_TOKEN", "")
         repo = data.get("GITHUB_BACKUP_REPO", "").strip().strip("/")
+        mode = data.get("GITHUB_BACKUP_MODE", "new") or "new"
         if not token or not repo:
             return {"ok": False, "error": "GitHub backup is not configured yet"}
+
+        # "New repo" mode only ever created the repo when the user clicked
+        # Verify — if they saved without verifying first (or the hourly
+        # auto-sync loop runs before anyone did), `git push` would 404 against
+        # a repo that never existed and the sync would silently fail from the
+        # user's perspective. Ensure it exists here too, so Save/Sync always
+        # produces a real backup regardless of whether Verify ran first.
+        if mode != "existing":
+            ensure = await _github_ensure_repo(token, repo)
+            if not ensure.get("ok"):
+                status = {"ok": False, "error": ensure.get("error", "Failed to create/access repo"), "synced_at": time.time(), "repo": repo}
+                _write_backup_status(status)
+                return status
 
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_backup_gitignore()

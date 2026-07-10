@@ -1901,6 +1901,14 @@ function app() {
           this.notify('Backup config saved', true);
           await this.loadConfig();
           await this.loadBackupStatus();
+          // Saving alone never pushes anything — GitHub repo creation (on
+          // Verify) leaves it empty, and the hourly auto-sync loop wouldn't
+          // run for up to an hour. Run the first sync immediately so "Save"
+          // actually produces a backup instead of silently doing nothing
+          // until the user finds and clicks "Sync Now" separately.
+          if (this.vars.GITHUB_BACKUP_TOKEN && this.vars.GITHUB_BACKUP_REPO) {
+            await this.syncBackupNow();
+          }
         } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
       } catch(e) { this.notify('Save failed: '+e.message, false); }
       this.backup.saving = false;
