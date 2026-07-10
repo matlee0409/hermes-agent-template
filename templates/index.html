@@ -1897,8 +1897,9 @@ function app() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ vars: { ...this.vars }, _restart: false }),
         });
+        const dd = await r.json().catch(()=>({}));
         if (r.ok) {
-          this.notify('Backup config saved', true);
+          this.notify(dd.warning ? `Backup config saved — ${dd.warning}` : 'Backup config saved', true);
           await this.loadConfig();
           await this.loadBackupStatus();
           // Saving alone never pushes anything — GitHub repo creation (on
@@ -1909,7 +1910,7 @@ function app() {
           if (this.vars.GITHUB_BACKUP_TOKEN && this.vars.GITHUB_BACKUP_REPO) {
             await this.syncBackupNow();
           }
-        } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
+        } else { this.notify(dd?.error||'Save failed', false); }
       } catch(e) { this.notify('Save failed: '+e.message, false); }
       this.backup.saving = false;
     },
@@ -2035,11 +2036,12 @@ function app() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ vars: { ...this.vars }, _restart: this.restartOnSave }),
         });
+        const d = await r.json().catch(()=>({}));
         if (r.ok) {
-          this.notify('Saved', true);
+          this.notify(d.warning || 'Saved', !d.warning ? true : false);
           this.selectedProvider = '';
           await this.loadConfig();
-        } else { const e = await r.json().catch(()=>{}); this.notify(e?.error||'Save failed', false); }
+        } else { this.notify(d?.error||'Save failed', false); }
       } catch(e) { this.notify('Save failed: '+e.message, false); }
       this.saving = false;
     },

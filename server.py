@@ -1512,17 +1512,32 @@ async def api_config_put(request: Request):
     try:
         restart = body.pop("_restart", False)
         new_vars = body.get("vars", {})
+        yaml_error = ""
         async with cfg_lock:
             existing = read_env(ENV_FILE)
             merged = unmask(new_vars, existing)
             for k, v in existing.items():
                 if k not in merged:
                     merged[k] = v
+            # .env is the source of truth for every setting (including the
+            # GitHub Backup fields, which config.yaml never touches). Persist
+            # it first and unconditionally, then best-effort refresh
+            # config.yaml — a yaml write failure (missing pyyaml, unparseable
+            # existing file, disk issue) must not make the whole save look
+            # like it failed to the user when their actual settings were
+            # written just fine.
             write_env(ENV_FILE, merged)
-            write_config_yaml(merged)
+            try:
+                write_config_yaml(merged)
+            except Exception as e:
+                yaml_error = str(e)
+                print(f"[config] write_config_yaml failed (settings were still saved): {e!r}", flush=True)
         if restart:
             asyncio.create_task(gw.restart())
-        return JSONResponse({"ok": True, "restarting": restart})
+        result = {"ok": True, "restarting": restart}
+        if yaml_error:
+            result["warning"] = f"Saved, but config.yaml was not updated: {yaml_error}"
+        return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

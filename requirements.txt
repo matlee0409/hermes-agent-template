@@ -3,6 +3,11 @@ uvicorn>=0.30.0
 jinja2>=3.1.0
 python-multipart>=0.0.9
 httpx>=0.27.0
+# config.yaml deep-merge (write_config_yaml) imports this directly. hermes-agent's
+# own install normally brings it transitively, but the admin server must not
+# depend on that — a missing/upgraded hermes extra silently 500s every config
+# save (including unrelated GitHub Backup settings) if this isn't pinned here too.
+pyyaml>=6.0
 # websockets is the upstream client our reverse proxy uses to connect to
 # hermes's /api/pty, /api/ws, /api/events endpoints. httpx does not speak
 # WebSockets, so we need a dedicated client library.
