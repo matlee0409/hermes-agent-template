@@ -8,6 +8,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <style>
   :root {
     --bg:        #0d0f14;
@@ -662,6 +665,40 @@
   }
   .header-branding a:hover { color: var(--accent); }
 
+  /* ── Terminal panel ──────────────────────────────── */
+  #terminal-container {
+    flex: 1;
+    overflow: hidden;
+    background: #0a0c10;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+  }
+  #terminal-container .xterm {
+    height: 100%;
+  }
+  #terminal-container .xterm-viewport {
+    overflow-y: hidden !important;
+  }
+  .term-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .term-dot { width:12px; height:12px; border-radius:50%; flex-shrink:0; }
+  .term-dot.connected    { background: var(--green); box-shadow: 0 0 5px var(--green); }
+  .term-dot.disconnected { background: var(--text-dim); }
+  .term-dot.error        { background: var(--red); }
+  .term-status-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
   /* ── Guide callout ───────────────────────────────── */
   .guide-callout {
     background: rgba(98,114,255,0.06);
@@ -734,6 +771,12 @@
          @click="isSetupDone && (page='logs')">
       <span class="nav-icon">≡</span>
       <span>Logs</span>
+    </div>
+    <div class="nav-item"
+         :class="{active: page==='terminal'}"
+         @click="page='terminal'; $nextTick(()=>initTerminal())">
+      <span class="nav-icon">⌨</span>
+      <span>Terminal</span>
     </div>
 
     <div class="nav-group-label" style="margin-top:8px">Manage</div>
@@ -1648,6 +1691,20 @@
       </div>
     </div>
 
+    <!-- ── Terminal panel ─────────────────────────── -->
+    <div class="panel" :class="{active: page==='terminal'}" style="overflow:hidden;">
+      <div class="panel-header" style="padding:12px 16px;">
+        <div class="panel-title">⌨ Terminal</div>
+        <div class="panel-subtitle">Interactive shell — run hermes commands directly</div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+          <div class="term-dot" :class="termState"></div>
+          <span class="term-status-label" x-text="termState==='connected'?'connected':termState==='error'?'error':'disconnected'"></span>
+          <button class="btn sm" @click="reconnectTerminal()" style="margin-left:8px;">↺ Reconnect</button>
+        </div>
+      </div>
+      <div id="terminal-container" x-ref="termContainer"></div>
+    </div>
+
   </div><!-- #main -->
 </div><!-- #layout -->
 
@@ -1712,6 +1769,14 @@ function app() {
     },
 
     xai: { loading: false, userCode: '', verificationUri: '', status: 'none', error: '' },
+
+    // ── Terminal state ──────────────────────────────
+    termState: 'disconnected',   // 'disconnected' | 'connected' | 'error'
+    _term: null,
+    _termFit: null,
+    _termWs: null,
+    _termResizeObs: null,
+    _termInited: false,
 
     selectedProvider: '',
 
@@ -2106,6 +2171,117 @@ function app() {
       if (!confirm('Revoke access for this user?')) return;
       await fetch('/setup/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
       this.notify('Revoked', true); await this.loadPairing();
+    },
+
+    // ── Terminal methods ────────────────────────────
+    initTerminal() {
+      // Only create the xterm instance once; reconnect WS on each visit.
+      const container = this.$refs.termContainer;
+      if (!container) return;
+
+      if (!this._termInited) {
+        this._termInited = true;
+        this._term = new Terminal({
+          fontFamily: '"IBM Plex Mono", Menlo, monospace',
+          fontSize: 13,
+          lineHeight: 1.4,
+          theme: {
+            background:  '#0a0c10',
+            foreground:  '#c9d1d9',
+            cursor:      '#6272ff',
+            cursorAccent:'#0a0c10',
+            black:       '#0d1117',
+            red:         '#f85149',
+            green:       '#3fb950',
+            yellow:      '#d29922',
+            blue:        '#6272ff',
+            magenta:     '#bc8cff',
+            cyan:        '#39c5cf',
+            white:       '#b1bac4',
+            brightBlack: '#6e7681',
+            brightRed:   '#ff7b72',
+            brightGreen: '#56d364',
+            brightYellow:'#e3b341',
+            brightBlue:  '#79c0ff',
+            brightMagenta:'#d2a8ff',
+            brightCyan:  '#56d4dd',
+            brightWhite: '#f0f6fc',
+          },
+          cursorBlink: true,
+          scrollback:  5000,
+          allowProposedApi: true,
+        });
+        this._termFit = new FitAddon.FitAddon();
+        this._term.loadAddon(this._termFit);
+        this._term.open(container);
+        this._termFit.fit();
+
+        // Resize observer — refit when the panel is resized.
+        this._termResizeObs = new ResizeObserver(() => {
+          if (this.page !== 'terminal') return;
+          try { this._termFit.fit(); } catch {}
+          this._sendResize();
+        });
+        this._termResizeObs.observe(container);
+
+        // Keyboard → WS
+        this._term.onData((data) => {
+          if (this._termWs && this._termWs.readyState === WebSocket.OPEN) {
+            const enc = new TextEncoder().encode(data);
+            this._termWs.send(enc);
+          }
+        });
+      } else {
+        // Already inited — just refit in case size changed.
+        try { this._termFit.fit(); } catch {}
+      }
+
+      this._connectTerminalWs();
+    },
+
+    _connectTerminalWs() {
+      if (this._termWs) {
+        try { this._termWs.close(); } catch {}
+        this._termWs = null;
+      }
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/setup/api/terminal/ws`);
+      ws.binaryType = 'arraybuffer';
+      this._termWs = ws;
+
+      ws.onopen = () => {
+        this.termState = 'connected';
+        this._sendResize();
+      };
+      ws.onclose = () => {
+        if (this.termState !== 'error') this.termState = 'disconnected';
+        if (this._term) this._term.write('\r\n\x1b[33m[disconnected — click ↺ Reconnect to restart]\x1b[0m\r\n');
+      };
+      ws.onerror = () => {
+        this.termState = 'error';
+      };
+      ws.onmessage = (ev) => {
+        if (!this._term) return;
+        if (ev.data instanceof ArrayBuffer) {
+          this._term.write(new Uint8Array(ev.data));
+        } else {
+          this._term.write(ev.data);
+        }
+      };
+    },
+
+    reconnectTerminal() {
+      if (this._term) this._term.clear();
+      this.termState = 'disconnected';
+      this._connectTerminalWs();
+    },
+
+    _sendResize() {
+      if (!this._termWs || this._termWs.readyState !== WebSocket.OPEN) return;
+      if (!this._term) return;
+      const cols = this._term.cols;
+      const rows = this._term.rows;
+      this._termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
     },
 
     fmtDate(ts) {

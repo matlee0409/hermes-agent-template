@@ -29,11 +29,15 @@ injected into every proxied HTML response so users can always return to the wiza
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
+import pty
 import re
 import secrets
 import signal
+import struct
+import termios
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1832,6 +1836,161 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ── Admin terminal WebSocket ──────────────────────────────────────────────────
+def _pty_set_winsize(fd: int, rows: int, cols: int) -> None:
+    """Set the terminal window size on a PTY master fd."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
+async def ws_terminal(websocket: WebSocket) -> None:
+    """PTY-backed interactive terminal for the admin dashboard.
+
+    Spawns a bash shell with a full pseudo-terminal so interactive programs
+    (hermes CLI, htop, vi, etc.) work correctly.  Client protocol:
+
+    - Binary frames  → raw bytes written to the PTY master (keyboard input).
+    - Text frames    → JSON control messages:
+        {"type":"resize","cols":<int>,"rows":<int>}  — resize the PTY.
+    - Binary frames ← raw PTY output (ANSI escape sequences included).
+
+    Auth: same HMAC cookie used by all other /setup/* routes.
+    """
+    if not _is_authenticated(websocket):
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+
+    # Build env: inherit everything + Hermes-specific vars from .env
+    env = {**os.environ, "HERMES_HOME": HERMES_HOME, "TERM": "xterm-256color",
+           "COLORTERM": "truecolor"}
+    env.update(read_env(ENV_FILE))
+
+    # Create PTY pair — master is kept in this process, slave goes to bash.
+    master_fd, slave_fd = pty.openpty()
+    _pty_set_winsize(slave_fd, 24, 80)
+
+    cwd = env.get("HOME", "/tmp")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", "--login",
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            cwd=cwd,
+            close_fds=True,
+            preexec_fn=os.setsid,
+        )
+    except Exception as e:
+        await websocket.send_text(json.dumps({"type": "error", "msg": str(e)}))
+        await websocket.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+        return
+
+    os.close(slave_fd)  # slave is only needed by the child process
+
+    loop = asyncio.get_event_loop()
+    pty_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    def _on_pty_readable() -> None:
+        try:
+            data = os.read(master_fd, 4096)
+            if data:
+                pty_queue.put_nowait(data)
+        except OSError:
+            pty_queue.put_nowait(None)
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:
+                pass
+
+    loop.add_reader(master_fd, _on_pty_readable)
+
+    async def _send_pty_output() -> None:
+        """Forward PTY output → WebSocket client."""
+        while True:
+            chunk = await pty_queue.get()
+            if chunk is None:
+                break
+            try:
+                await websocket.send_bytes(chunk)
+            except Exception:
+                break
+
+    async def _recv_client_input() -> None:
+        """Forward WebSocket client → PTY input, handle resize JSON."""
+        while True:
+            try:
+                msg = await websocket.receive()
+            except Exception:
+                break
+            if msg.get("type") == "websocket.disconnect":
+                break
+            raw = msg.get("bytes")
+            if raw is not None:
+                try:
+                    os.write(master_fd, raw)
+                except OSError:
+                    break
+                continue
+            text = msg.get("text")
+            if text is not None:
+                try:
+                    ctrl = json.loads(text)
+                    if ctrl.get("type") == "resize":
+                        rows = max(1, int(ctrl.get("rows", 24)))
+                        cols = max(1, int(ctrl.get("cols", 80)))
+                        _pty_set_winsize(master_fd, rows, cols)
+                except Exception:
+                    try:
+                        os.write(master_fd, text.encode())
+                    except OSError:
+                        break
+
+    send_task = asyncio.create_task(_send_pty_output())
+    recv_task = asyncio.create_task(_recv_client_input())
+
+    try:
+        done, pending = await asyncio.wait(
+            {send_task, recv_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        try:
+            loop.remove_reader(master_fd)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+
 # ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
 _WIDGET_LINK_STYLE = (
     "background:rgba(20,24,31,0.92);backdrop-filter:blur(8px);"
@@ -2182,6 +2341,9 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+
+    # Terminal WebSocket — PTY-backed interactive shell.
+    WebSocketRoute("/setup/api/terminal/ws",    ws_terminal),
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
