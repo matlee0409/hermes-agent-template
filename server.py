@@ -1865,8 +1865,7 @@ async def ws_terminal(websocket: WebSocket) -> None:
     await websocket.accept()
 
     # Build env: inherit everything + Hermes-specific vars from .env
-    env = {**os.environ, "HERMES_HOME": HERMES_HOME, "TERM": "xterm-256color",
-           "COLORTERM": "truecolor"}
+    env = {**os.environ, "HERMES_HOME": HERMES_HOME, "TERM": "xterm-256color"}
     env.update(read_env(ENV_FILE))
 
     # Create PTY pair — master is kept in this process, slave goes to bash.

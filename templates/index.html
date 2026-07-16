@@ -2225,7 +2225,12 @@ function app() {
         this._termResizeObs.observe(container);
 
         // Keyboard → WS
+        // Filter out OSC sequences that xterm.js auto-generates as replies to
+        // terminal capability queries (e.g. \e]11;rgb:… background-color replies).
+        // Forwarding those to the PTY causes them to be echoed as visible text in
+        // the shell prompt.
         this._term.onData((data) => {
+          if (data.startsWith('\x1b]') || data.startsWith('\x9d')) return;
           if (this._termWs && this._termWs.readyState === WebSocket.OPEN) {
             const enc = new TextEncoder().encode(data);
             this._termWs.send(enc);
