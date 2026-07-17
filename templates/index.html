@@ -11,6 +11,8 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.js"></script>
 <style>
   :root {
     --bg:        #0d0f14;
@@ -696,11 +698,18 @@
   .header-branding a:hover { color: var(--accent); }
 
   /* ── Terminal panel ──────────────────────────────── */
+  #terminal-wrapper {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
   #terminal-container {
     flex: 1;
     overflow: hidden;
     background: #0a0c10;
-    padding: 8px;
+    padding: 6px 8px 8px;
     display: flex;
     flex-direction: column;
   }
@@ -713,21 +722,111 @@
   .term-toolbar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 8px 16px;
+    gap: 8px;
+    padding: 6px 12px;
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
+    flex-wrap: wrap;
   }
-  .term-dot { width:12px; height:12px; border-radius:50%; flex-shrink:0; }
-  .term-dot.connected    { background: var(--green); box-shadow: 0 0 5px var(--green); }
+  .term-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; transition: background 0.2s, box-shadow 0.2s; }
+  .term-dot.connected    { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .term-dot.disconnected { background: var(--text-dim); }
+  .term-dot.reconnecting { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: term-pulse 1s infinite; }
   .term-dot.error        { background: var(--red); }
+  @keyframes term-pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
   .term-status-label {
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--text-dim);
+    min-width: 80px;
   }
+  .term-divider {
+    width: 1px;
+    height: 16px;
+    background: var(--border);
+    flex-shrink: 0;
+    margin: 0 2px;
+  }
+  .term-font-ctrl {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .term-font-ctrl button {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    width: 22px;
+    height: 22px;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.15s;
+  }
+  .term-font-ctrl button:hover { background: var(--border); }
+  .term-font-size-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    min-width: 26px;
+    text-align: center;
+  }
+  /* Search bar overlay */
+  #term-search-bar {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+  #term-search-bar input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    border-radius: 4px;
+    padding: 3px 8px;
+    outline: none;
+    width: 180px;
+  }
+  #term-search-bar input:focus { border-color: var(--accent); }
+  #term-search-bar .term-search-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  #term-search-bar .term-search-btn:hover { background: var(--border); }
+  #term-search-bar .term-search-close {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  #term-search-bar .term-search-close:hover { color: var(--text); }
+  .xterm-find-result { background: rgba(98,114,255,0.35) !important; }
+  .xterm-find-result-focused { background: rgba(98,114,255,0.7) !important; }
 
   /* ── Guide callout ───────────────────────────────── */
   .guide-callout {
@@ -1729,13 +1828,36 @@
       <div class="panel-header" style="padding:12px 16px;">
         <div class="panel-title">⌨ Terminal</div>
         <div class="panel-subtitle">Interactive shell — run hermes commands directly</div>
-        <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
-          <div class="term-dot" :class="termState"></div>
-          <span class="term-status-label" x-text="termState==='connected'?'connected':termState==='error'?'error':'disconnected'"></span>
-          <button class="btn sm" @click="reconnectTerminal()" style="margin-left:8px;">↺ Reconnect</button>
-        </div>
       </div>
-      <div id="terminal-container" x-ref="termContainer"></div>
+      <div id="terminal-wrapper">
+        <!-- Toolbar -->
+        <div class="term-toolbar">
+          <div class="term-dot" :class="termState"></div>
+          <span class="term-status-label" x-text="termState==='connected'?'connected':termState==='reconnecting'?'reconnecting…':termState==='error'?'error':'disconnected'"></span>
+          <div class="term-divider"></div>
+          <button class="btn sm" @click="reconnectTerminal()" title="Reconnect shell">↺ Reconnect</button>
+          <button class="btn sm" @click="clearTerminal()" title="Clear screen">⌫ Clear</button>
+          <div class="term-divider"></div>
+          <div class="term-font-ctrl" title="Font size">
+            <button @click="termFontDec()" title="Decrease font size">−</button>
+            <span class="term-font-size-label" x-text="termFontSize+'px'"></span>
+            <button @click="termFontInc()" title="Increase font size">+</button>
+          </div>
+          <div class="term-divider"></div>
+          <button class="btn sm" @click="toggleTermSearch()" title="Search (Ctrl+Shift+F)">⌕ Search</button>
+        </div>
+        <!-- Search bar (floats over terminal) -->
+        <div id="term-search-bar" x-show="termSearchOpen" x-cloak @keydown.escape.window="termSearchOpen && closeTermSearch()">
+          <input type="text" placeholder="Find…" x-model="termSearchQuery"
+                 @input="termSearchFind()" @keydown.enter="termSearchFind(false)"
+                 @keydown.shift.enter="termSearchFind(true)"
+                 x-ref="termSearchInput">
+          <button class="term-search-btn" @click="termSearchFind(true)" title="Previous (Shift+Enter)">↑</button>
+          <button class="term-search-btn" @click="termSearchFind(false)" title="Next (Enter)">↓</button>
+          <button class="term-search-close" @click="closeTermSearch()" title="Close">✕</button>
+        </div>
+        <div id="terminal-container" x-ref="termContainer"></div>
+      </div>
     </div>
 
   </div><!-- #main -->
@@ -1805,12 +1927,18 @@ function app() {
     xai: { loading: false, userCode: '', verificationUri: '', status: 'none', error: '' },
 
     // ── Terminal state ──────────────────────────────
-    termState: 'disconnected',   // 'disconnected' | 'connected' | 'error'
+    termState: 'disconnected',   // 'disconnected' | 'reconnecting' | 'connected' | 'error'
+    termFontSize: 13,
+    termSearchOpen: false,
+    termSearchQuery: '',
     _term: null,
     _termFit: null,
+    _termSearch: null,
     _termWs: null,
     _termResizeObs: null,
     _termInited: false,
+    _termReconnectTimer: null,
+    _termReconnectAttempt: 0,
 
     selectedProvider: '',
 
@@ -2216,37 +2344,54 @@ function app() {
       if (!this._termInited) {
         this._termInited = true;
         this._term = new Terminal({
-          fontFamily: '"IBM Plex Mono", Menlo, monospace',
-          fontSize: 13,
-          lineHeight: 1.4,
+          fontFamily: '"IBM Plex Mono", Menlo, "Courier New", monospace',
+          fontSize: this.termFontSize,
+          lineHeight: 1.45,
+          letterSpacing: 0.3,
           theme: {
-            background:  '#0a0c10',
-            foreground:  '#c9d1d9',
-            cursor:      '#6272ff',
-            cursorAccent:'#0a0c10',
-            black:       '#0d1117',
-            red:         '#f85149',
-            green:       '#3fb950',
-            yellow:      '#d29922',
-            blue:        '#6272ff',
-            magenta:     '#bc8cff',
-            cyan:        '#39c5cf',
-            white:       '#b1bac4',
-            brightBlack: '#6e7681',
-            brightRed:   '#ff7b72',
-            brightGreen: '#56d364',
-            brightYellow:'#e3b341',
-            brightBlue:  '#79c0ff',
+            background:   '#0a0c10',
+            foreground:   '#c9d1d9',
+            cursor:       '#6272ff',
+            cursorAccent: '#0a0c10',
+            selectionBackground: 'rgba(98,114,255,0.25)',
+            black:        '#0d1117',
+            red:          '#f85149',
+            green:        '#3fb950',
+            yellow:       '#d29922',
+            blue:         '#6272ff',
+            magenta:      '#bc8cff',
+            cyan:         '#39c5cf',
+            white:        '#b1bac4',
+            brightBlack:  '#6e7681',
+            brightRed:    '#ff7b72',
+            brightGreen:  '#56d364',
+            brightYellow: '#e3b341',
+            brightBlue:   '#79c0ff',
             brightMagenta:'#d2a8ff',
-            brightCyan:  '#56d4dd',
-            brightWhite: '#f0f6fc',
+            brightCyan:   '#56d4dd',
+            brightWhite:  '#f0f6fc',
           },
-          cursorBlink: true,
-          scrollback:  5000,
+          cursorBlink:      true,
+          cursorStyle:      'bar',
+          scrollback:       10000,
           allowProposedApi: true,
+          copyOnSelect:     true,
+          scrollOnUserInput:true,
+          smoothScrollDuration: 80,
         });
+
+        // Addons
         this._termFit = new FitAddon.FitAddon();
         this._term.loadAddon(this._termFit);
+
+        if (typeof WebLinksAddon !== 'undefined') {
+          this._term.loadAddon(new WebLinksAddon.WebLinksAddon());
+        }
+        if (typeof SearchAddon !== 'undefined') {
+          this._termSearch = new SearchAddon.SearchAddon();
+          this._term.loadAddon(this._termSearch);
+        }
+
         this._term.open(container);
         this._termFit.fit();
 
@@ -2266,10 +2411,20 @@ function app() {
         this._term.onData((data) => {
           if (data.startsWith('\x1b]') || data.startsWith('\x9d')) return;
           if (this._termWs && this._termWs.readyState === WebSocket.OPEN) {
-            const enc = new TextEncoder().encode(data);
-            this._termWs.send(enc);
+            this._termWs.send(new TextEncoder().encode(data));
           }
         });
+
+        // Ctrl+Shift+F → open search
+        this._term.attachCustomKeyEventHandler((ev) => {
+          if (ev.ctrlKey && ev.shiftKey && ev.key === 'F') {
+            ev.preventDefault();
+            this.toggleTermSearch();
+            return false;
+          }
+          return true;
+        });
+
       } else {
         // Already inited — just refit in case size changed.
         try { this._termFit.fit(); } catch {}
@@ -2279,6 +2434,8 @@ function app() {
     },
 
     _connectTerminalWs() {
+      // Cancel any pending auto-reconnect
+      if (this._termReconnectTimer) { clearTimeout(this._termReconnectTimer); this._termReconnectTimer = null; }
       if (this._termWs) {
         try { this._termWs.close(); } catch {}
         this._termWs = null;
@@ -2290,15 +2447,32 @@ function app() {
 
       ws.onopen = () => {
         this.termState = 'connected';
+        this._termReconnectAttempt = 0;
         this._sendResize();
+        if (this._term) this._term.focus();
       };
-      ws.onclose = () => {
-        if (this.termState !== 'error') this.termState = 'disconnected';
-        if (this._term) this._term.write('\r\n\x1b[33m[disconnected — click ↺ Reconnect to restart]\x1b[0m\r\n');
+
+      ws.onclose = (ev) => {
+        if (this.termState === 'connected') {
+          // Only show the disconnect notice when we were actually connected
+          if (this._term) this._term.write('\r\n\x1b[33m⚠ Session ended\x1b[0m\r\n');
+        }
+        // Auto-reconnect with exponential backoff (max 5 attempts, cap 30 s)
+        if (this._termReconnectAttempt < 5 && ev.code !== 4401 /* auth failure */) {
+          const delay = Math.min(1000 * Math.pow(2, this._termReconnectAttempt), 30000);
+          this._termReconnectAttempt++;
+          this.termState = 'reconnecting';
+          if (this._term) this._term.write(`\x1b[33mReconnecting in ${Math.round(delay/1000)}s (attempt ${this._termReconnectAttempt}/5)…\x1b[0m\r\n`);
+          this._termReconnectTimer = setTimeout(() => this._connectTerminalWs(), delay);
+        } else {
+          this.termState = ev.code === 4401 ? 'error' : 'disconnected';
+          if (this._term && this._termReconnectAttempt >= 5)
+            this._term.write('\x1b[31mCould not reconnect — click ↺ Reconnect to try again.\x1b[0m\r\n');
+        }
       };
-      ws.onerror = () => {
-        this.termState = 'error';
-      };
+
+      ws.onerror = () => { this.termState = 'error'; };
+
       ws.onmessage = (ev) => {
         if (!this._term) return;
         if (ev.data instanceof ArrayBuffer) {
@@ -2310,17 +2484,58 @@ function app() {
     },
 
     reconnectTerminal() {
-      if (this._term) this._term.clear();
+      this._termReconnectAttempt = 0;
       this.termState = 'disconnected';
+      if (this._term) this._term.clear();
       this._connectTerminalWs();
+    },
+
+    clearTerminal() {
+      if (this._term) { this._term.clear(); this._term.focus(); }
+    },
+
+    termFontInc() {
+      if (this.termFontSize >= 24) return;
+      this.termFontSize++;
+      if (this._term) { this._term.options.fontSize = this.termFontSize; try { this._termFit.fit(); } catch {} this._sendResize(); }
+    },
+
+    termFontDec() {
+      if (this.termFontSize <= 8) return;
+      this.termFontSize--;
+      if (this._term) { this._term.options.fontSize = this.termFontSize; try { this._termFit.fit(); } catch {} this._sendResize(); }
+    },
+
+    toggleTermSearch() {
+      this.termSearchOpen = !this.termSearchOpen;
+      if (this.termSearchOpen) {
+        this.$nextTick(() => { if (this.$refs.termSearchInput) this.$refs.termSearchInput.focus(); });
+      } else {
+        if (this._termSearch) this._termSearch.clearDecorations();
+        if (this._term) this._term.focus();
+      }
+    },
+
+    closeTermSearch() {
+      this.termSearchOpen = false;
+      if (this._termSearch) this._termSearch.clearDecorations();
+      if (this._term) this._term.focus();
+    },
+
+    termSearchFind(backwards = false) {
+      if (!this._termSearch || !this.termSearchQuery) return;
+      const opts = { regex: false, wholeWord: false, caseSensitive: false, incremental: !backwards };
+      if (backwards) {
+        this._termSearch.findPrevious(this.termSearchQuery, opts);
+      } else {
+        this._termSearch.findNext(this.termSearchQuery, opts);
+      }
     },
 
     _sendResize() {
       if (!this._termWs || this._termWs.readyState !== WebSocket.OPEN) return;
       if (!this._term) return;
-      const cols = this._term.cols;
-      const rows = this._term.rows;
-      this._termWs.send(JSON.stringify({ type: 'resize', cols, rows }));
+      this._termWs.send(JSON.stringify({ type: 'resize', cols: this._term.cols, rows: this._term.rows }));
     },
 
     fmtDate(ts) {
